@@ -1,8 +1,5 @@
-import os
-import asyncio
-import datetime
+import os, datetime, asyncio
 from typing import Optional
-
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -21,32 +18,30 @@ ADMIN_ROLE_ID = int(os.getenv('ADMIN_ROLE_ID'))
 LOG_CHANNEL_ID = int(os.getenv('LOG_CHANNEL_ID'))
 CART_CATEGORY_ID = int(os.getenv('CART_CATEGORY_ID'))
 
-MENSAGEM_POS_CONFIRMACAO = (
-    "Para receber seu produto, abra um ticket e mande o comprovante e nome."
-)
+MENSAGEM_POS_CONFIRMACAO = "Para receber seu produto, abra um ticket e mande o comprovante e nome."
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 intents = discord.Intents.default()
 intents.message_content = False
 bot = commands.Bot(command_prefix='!', intents=intents)
 tree = bot.tree
 
-def is_admin(interaction: discord.Interaction) -> bool:
+def is_admin(interaction):
     return any(role.id == ADMIN_ROLE_ID for role in interaction.user.roles)
 
-def crc16_ccitt(data: bytes) -> int:
+def crc16_ccitt(data):
     crc = 0xFFFF
-    for byte in data:
+    for b in data:
         crc = ((crc >> 8) | (crc << 8)) & 0xFFFF
-        crc ^= byte
+        crc ^= b
         crc ^= (crc & 0xFF) >> 4
         crc ^= (crc << 8) & 0xFFFF
         crc ^= ((crc & 0xFF) << 4) << 8
         crc ^= (crc >> 8) & 0xFF
     return crc
 
-def gerar_pix_payload(valor: float, txid: str) -> str:
+def gerar_pix_payload(valor, txid):
     txid = txid[:25]
     payload = "000201"
     merchant_info = f"0014br.gov.bcb.pix0108{PIX_KEY}"
@@ -66,7 +61,7 @@ def gerar_pix_payload(valor: float, txid: str) -> str:
     return payload
 
 class ProdutoView(View):
-    def __init__(self, produto_id: int, tem_variacoes: bool):
+    def __init__(self, produto_id, tem_variacoes):
         super().__init__(timeout=None)
         self.produto_id = produto_id
         if tem_variacoes:
@@ -75,42 +70,264 @@ class ProdutoView(View):
             self.add_item(ComprarSemVariacaoButton(produto_id))
 
 class SelecionarVariacaoButton(Button):
-    def __init__(self, produto_id: int):
+    def __init__(self, produto_id):
         super().__init__(label="🛒 Selecionar Variação", style=discord.ButtonStyle.primary, custom_id=f"var_{produto_id}")
-
-    async def callback(self, interaction: discord.Interaction):
+    async def callback(self, interaction):
         vars = supabase.table("product_variations").select("*").eq("product_id", self.produto_id).execute().data
         if not vars:
-            await interaction.response.send_message("Este produto não possui variações no momento.", ephemeral=True)
+            await interaction.response.send_message("Sem variações.", ephemeral=True)
             return
-
         options = [discord.SelectOption(label=f"{v['nome']} - R$ {v['preco']:.2f}", value=str(v['id'])) for v in vars]
-        select = Select(placeholder="Escolha a variação...", options=options)
-
-        async def select_callback(select_interaction: discord.Interaction):
-            var_id = int(select_interaction.data['values'][0])
-            variacao = next((v for v in vars if v['id'] == var_id), None)
-            if not variacao:
-                await select_interaction.response.send_message("Erro ao obter variação.", ephemeral=True)
-                return
-            await self.criar_pedido(select_interaction, self.produto_id, variacao)
-
+        select = Select(placeholder="Escolha...", options=options)
+        async def select_callback(si):
+            vid = int(si.data['values'][0])
+            var = next(v for v in vars if v['id'] == vid)
+            await self.criar_pedido(si, self.produto_id, var)
         select.callback = select_callback
-        view = View()
-        view.add_item(select)
-        await interaction.response.send_message("Selecione a variação desejada:", view=view, ephemeral=True)
-
-    async def criar_pedido(self, interaction: discord.Interaction, produto_id: int, variacao: dict):
+        v = View()
+        v.add_item(select)
+        await interaction.response.send_message("Selecione:", view=v, ephemeral=True)
+    async def criar_pedido(self, interaction, produto_id, variacao):
         await interaction.response.defer(ephemeral=True)
-        produto = supabase.table("products").select("*").eq("id", produto_id).execute().data[0]
+        prod = supabase.table("products").select("*").eq("id", produto_id).execute().data[0]
         valor = variacao['preco']
         txid = f"{interaction.user.id}_{datetime.datetime.utcnow().timestamp()}"
-        payload_pix = gerar_pix_payload(valor, txid)
-
-        categoria = bot.get_channel(CART_CATEGORY_ID)
-        if not categoria:
-            await interaction.followup.send("Erro: categoria de carrinhos não encontrada.", ephemeral=True)
+        pix = gerar_pix_payload(valor, txid)
+        cat = bot.get_channel(CART_CATEGORY_ID)
+        if not cat:
+            await interaction.followup.send("Erro categoria.", ephemeral=True)
             return
+        thread = await cat.create_thread(name=f"pedido-{interaction.user.name[:20]}-{produto_id}", type=discord.ChannelType.private_thread)
+        await thread.add_user(interaction.user)
+        supabase.table("orders").insert({
+            "user_id": str(interaction.user.id),
+            "product_id": produto_id,
+            "variation_id": variacao['id'],
+            "amount": valor,
+            "status": "pending",
+            "payment_id": txid,
+            "thread_id": thread.id,
+            "cargo_entregue": False
+        }).execute()
+        embed = discord.Embed(title="🛒 Pedido", description=f"{prod['nome']} - {variacao['nome']}\nR$ {valor:.2f}", color=discord.Color.from_str(prod['cor_embed']))
+        embed.add_field(name="Pix", value=f"```{pix}```", inline=False)
+        await thread.send(content=interaction.user.mention, embed=embed)
+        log = bot.get_channel(LOG_CHANNEL_ID)
+        if log:
+            await log.send(embed=discord.Embed(title="🆕 Pedido", description=f"{interaction.user.mention}\n{prod['nome']} - {variacao['nome']}\nR$ {valor:.2f}", color=discord.Color.blue(), timestamp=datetime.datetime.utcnow()))
+        await interaction.followup.send(f"✅ Pedido criado: {thread.mention}", ephemeral=True)
+
+class ComprarSemVariacaoButton(Button):
+    def __init__(self, produto_id):
+        super().__init__(label="💳 Comprar", style=discord.ButtonStyle.success, custom_id=f"buy_{produto_id}")
+    async def callback(self, interaction):
+        prod = supabase.table("products").select("*").eq("id", self.produto_id).execute().data[0]
+        if not prod:
+            await interaction.response.send_message("Produto não encontrado.", ephemeral=True)
+            return
+        valor = prod['preco']
+        txid = f"{interaction.user.id}_{datetime.datetime.utcnow().timestamp()}"
+        pix = gerar_pix_payload(valor, txid)
+        await interaction.response.defer(ephemeral=True)
+        cat = bot.get_channel(CART_CATEGORY_ID)
+        if not cat:
+            await interaction.followup.send("Erro categoria.", ephemeral=True)
+            return
+        thread = await cat.create_thread(name=f"pedido-{interaction.user.name[:20]}-{self.produto_id}", type=discord.ChannelType.private_thread)
+        await thread.add_user(interaction.user)
+        supabase.table("orders").insert({
+            "user_id": str(interaction.user.id),
+            "product_id": self.produto_id,
+            "variation_id": None,
+            "amount": valor,
+            "status": "pending",
+            "payment_id": txid,
+            "thread_id": thread.id,
+            "cargo_entregue": False
+        }).execute()
+        embed = discord.Embed(title="🛒 Pedido", description=f"{prod['nome']}\nR$ {valor:.2f}", color=discord.Color.from_str(prod['cor_embed']))
+        embed.add_field(name="Pix", value=f"```{pix}```", inline=False)
+        await thread.send(content=interaction.user.mention, embed=embed)
+        log = bot.get_channel(LOG_CHANNEL_ID)
+        if log:
+            await log.send(embed=discord.Embed(title="🆕 Pedido", description=f"{interaction.user.mention}\n{prod['nome']}\nR$ {valor:.2f}", color=discord.Color.blue(), timestamp=datetime.datetime.utcnow()))
+        await interaction.followup.send(f"✅ Pedido criado: {thread.mention}", ephemeral=True)
+
+@tree.command(name="criar_produto", description="ADM")
+@app_commands.describe(nome="Nome", descricao="Desc", preco="0 se tiver variação", cargo_id="ID do cargo", thumbnail_url="URL", banner_url="URL")
+async def criar_produto(interaction, nome: str, descricao: str, preco: float, cargo_id: str, thumbnail_url: str, banner_url: str):
+    if not is_admin(interaction):
+        return await interaction.response.send_message("Permissão negada.", ephemeral=True)
+    data = {
+        "nome": nome, "descricao": descricao, "preco": None if preco == 0 else preco,
+        "cargo_id": int(cargo_id), "cor_embed": "#ffffff",
+        "thumbnail_url": thumbnail_url, "banner_url": banner_url,
+        "canal_id": interaction.channel_id, "mensagem_id": None
+    }
+    res = supabase.table("products").insert(data).execute()
+    pid = res.data[0]['id']
+    embed = discord.Embed(title=nome, description=descricao, color=0xffffff)
+    if preco and preco > 0:
+        embed.add_field(name="Preço", value=f"R$ {preco:.2f}")
+    embed.set_thumbnail(url=thumbnail_url)
+    embed.set_image(url=banner_url)
+    view = ProdutoView(pid, preco == 0)
+    msg = await interaction.channel.send(embed=embed, view=view)
+    supabase.table("products").update({"mensagem_id": msg.id}).eq("id", pid).execute()
+    await interaction.response.send_message(f"✅ ID: {pid}", ephemeral=True)
+
+@tree.command(name="adicionar_variacao", description="ADM")
+@app_commands.describe(produto_id="ID", nome="Nome", preco="Preço", cargo_id="Opcional")
+async def adicionar_variacao(interaction, produto_id: int, nome: str, preco: float, cargo_id: Optional[str] = None):
+    if not is_admin(interaction):
+        return await interaction.response.send_message("Permissão negada.", ephemeral=True)
+    supabase.table("product_variations").insert({
+        "product_id": produto_id, "nome": nome, "preco": preco,
+        "cargo_id": int(cargo_id) if cargo_id else None
+    }).execute()
+    prod = supabase.table("products").select("*").eq("id", produto_id).execute().data[0]
+    if prod['mensagem_id'] and prod['canal_id']:
+        canal = bot.get_channel(prod['canal_id'])
+        if canal:
+            try:
+                msg = await canal.fetch_message(prod['mensagem_id'])
+                await msg.edit(view=ProdutoView(produto_id, True))
+            except:
+                pass
+    await interaction.response.send_message(f"✅ Variação '{nome}' adicionada.", ephemeral=True)
+
+@tree.command(name="pedidos", description="ADM")
+async def pedidos(interaction):
+    if not is_admin(interaction):
+        return await interaction.response.send_message("Permissão negada.", ephemeral=True)
+    lista = supabase.table("orders").select("*, products(nome), product_variations(nome)").eq("status", "pending").order("criado_em", desc=True).execute().data
+    if not lista:
+        return await interaction.response.send_message("Nenhum pedido pendente.", ephemeral=True)
+    total = len(lista)
+    def embed_pedido(idx):
+        p = lista[idx]
+        e = discord.Embed(title=f"Pedido #{p['id']}", color=discord.Color.orange())
+        e.add_field(name="Cliente", value=f"<@{p['user_id']}>", inline=True)
+        e.add_field(name="Produto", value=p['products']['nome'], inline=True)
+        if p['variation_id']:
+            e.add_field(name="Variação", value=p['product_variations']['nome'], inline=True)
+        e.add_field(name="Valor", value=f"R$ {p['amount']:.2f}", inline=True)
+        e.add_field(name="Status", value=p['status'], inline=True)
+        e.add_field(name="Data", value=p['criado_em'][:10], inline=True)
+        e.set_footer(text=f"{idx+1}/{total}")
+        return e
+    class PedidosView(View):
+        def __init__(self, p):
+            super().__init__(timeout=180)
+            self.pedidos = p
+            self.idx = 0
+        @discord.ui.button(label="◀", style=discord.ButtonStyle.blurple)
+        async def ant(self, i, b):
+            if not is_admin(i): return await i.response.send_message("Não", ephemeral=True)
+            self.idx = (self.idx - 1) % total
+            await i.response.edit_message(embed=embed_pedido(self.idx), view=self)
+        @discord.ui.button(label="▶", style=discord.ButtonStyle.blurple)
+        async def prox(self, i, b):
+            if not is_admin(i): return await i.response.send_message("Não", ephemeral=True)
+            self.idx = (self.idx + 1) % total
+            await i.response.edit_message(embed=embed_pedido(self.idx), view=self)
+        @discord.ui.button(label="✅ Confirmar", style=discord.ButtonStyle.success)
+        async def conf(self, i, b):
+            if not is_admin(i): return await i.response.send_message("Não", ephemeral=True)
+            p = self.pedidos[self.idx]
+            supabase.table("orders").update({"status": "paid"}).eq("id", p['id']).execute()
+            member = i.guild.get_member(int(p['user_id']))
+            if member:
+                if p['variation_id']:
+                    var = supabase.table("product_variations").select("cargo_id").eq("id", p['variation_id']).execute().data[0]
+                    cid = var['cargo_id'] or supabase.table("products").select("cargo_id").eq("id", p['product_id']).execute().data[0]['cargo_id']
+                else:
+                    cid = supabase.table("products").select("cargo_id").eq("id", p['product_id']).execute().data[0]['cargo_id']
+                role = i.guild.get_role(int(cid))
+                if role:
+                    await member.add_roles(role)
+                    supabase.table("orders").update({"cargo_entregue": True}).eq("id", p['id']).execute()
+            if p['thread_id']:
+                thread = bot.get_channel(int(p['thread_id']))
+                if thread:
+                    await thread.send(f"✅ **Pagamento confirmado!**\n{MENSAGEM_POS_CONFIRMACAO}")
+                    await thread.edit(archived=True, locked=True)
+            await i.response.send_message(f"Pedido #{p['id']} confirmado.", ephemeral=True)
+            self.pedidos.pop(self.idx)
+            if not self.pedidos:
+                await i.edit_original_response(content="Nenhum pedido.", embed=None, view=None)
+            else:
+                self.idx = min(self.idx, len(self.pedidos)-1)
+                await i.edit_original_response(embed=embed_pedido(self.idx), view=self)
+        @discord.ui.button(label="❌ Cancelar", style=discord.ButtonStyle.danger)
+        async def canc(self, i, b):
+            if not is_admin(i): return await i.response.send_message("Não", ephemeral=True)
+            p = self.pedidos[self.idx]
+            supabase.table("orders").update({"status": "cancelled"}).eq("id", p['id']).execute()
+            if p['thread_id']:
+                thread = bot.get_channel(int(p['thread_id']))
+                if thread:
+                    await thread.send("❌ Cancelado.")
+                    await thread.edit(archived=True, locked=True)
+            await i.response.send_message(f"Pedido #{p['id']} cancelado.", ephemeral=True)
+            self.pedidos.pop(self.idx)
+            if not self.pedidos:
+                await i.edit_original_response(content="Nenhum pedido.", embed=None, view=None)
+            else:
+                self.idx = min(self.idx, len(self.pedidos)-1)
+                await i.edit_original_response(embed=embed_pedido(self.idx), view=self)
+    await interaction.response.send_message(embed=embed_pedido(0), view=PedidosView(lista))
+
+@tree.command(name="dashboard", description="ADM")
+async def dashboard(interaction):
+    if not is_admin(interaction): return await interaction.response.send_message("Não.", ephemeral=True)
+    total_pagos = supabase.table("orders").select("id", count="exact").eq("status", "paid").execute().count
+    p = supabase.table("orders").select("amount").eq("status", "paid").execute().data
+    fat_total = sum(o['amount'] for o in p)
+    hoje = datetime.date.today().isoformat()
+    hoje_pagos = supabase.table("orders").select("amount").eq("status", "paid").gte("criado_em", f"{hoje}T00:00:00").execute().data
+    fat_hoje = sum(o['amount'] for o in hoje_pagos)
+    embed = discord.Embed(title="📊 Dashboard", color=discord.Color.green())
+    embed.add_field(name="Pedidos Pagos", value=str(total_pagos), inline=False)
+    embed.add_field(name="Faturamento Total", value=f"R$ {fat_total:.2f}", inline=False)
+    embed.add_field(name="Faturamento Hoje", value=f"R$ {fat_hoje:.2f}", inline=False)
+    await interaction.response.send_message(embed=embed)
+
+@tree.command(name="remover_produto", description="ADM")
+async def remover_produto(interaction, produto_id: int):
+    if not is_admin(interaction): return await interaction.response.send_message("Não.", ephemeral=True)
+    prod = supabase.table("products").select("*").eq("id", produto_id).execute().data
+    if not prod: return await interaction.response.send_message("Não existe.", ephemeral=True)
+    p = prod[0]
+    if p['mensagem_id'] and p['canal_id']:
+        canal = bot.get_channel(p['canal_id'])
+        if canal:
+            try:
+                msg = await canal.fetch_message(p['mensagem_id'])
+                await msg.delete()
+            except:
+                pass
+    supabase.table("products").delete().eq("id", produto_id).execute()
+    await interaction.response.send_message(f"✅ Produto {produto_id} removido.", ephemeral=True)
+
+@bot.event
+async def on_ready():
+    await tree.sync()
+    print(f"✅ Bot logado como {bot.user}")
+    prods = supabase.table("products").select("*").execute().data
+    for p in prods:
+        if p['mensagem_id'] and p['canal_id']:
+            canal = bot.get_channel(p['canal_id'])
+            if canal:
+                try:
+                    msg = await canal.fetch_message(p['mensagem_id'])
+                    tem_var = supabase.table("product_variations").select("id", count="exact").eq("product_id", p['id']).execute().count > 0
+                    await msg.edit(view=ProdutoView(p['id'], tem_var))
+                except:
+                    pass
+
+if __name__ == "__main__":
+    bot.run(TOKEN)            return
 
         thread = await categoria.create_thread(
             name=f"pedido-{interaction.user.name[:20]}-{produto_id}",
